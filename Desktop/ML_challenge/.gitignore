@@ -1,0 +1,81 @@
+# ==============================================================================
+# Git Ignore for Entity Resolution Machine Learning Project
+# ==============================================================================
+
+# Python Virtual Environments
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Bytecode & Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+
+# Testing & Linting Caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Large Datasets & Archives (Never push multi-gigabyte raw data to Git)
+dataset/
+student_resource/dataset/
+*.tsv
+*.csv
+*.zip
+*.tar
+*.tar.gz
+*.gz
+6ab10eb3b23ba_student_resource.zip
+*_submission.zip
+
+# Output Predictions & Submission Files
+output/*.tsv
+output/*.csv
+output/
+
+# Trained Models, Checkpoints & Large Artifacts
+models/*.xgboost
+models/*.lightgbm
+models/*.bin
+models/*.joblib
+models/*.pt
+models/*.pth
+
+# Logs & Runtime Diagnostics
+logs/
+*.log
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+__MACOSX/
+
+# IDE & Editor Specific
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Build & Packaging Artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
