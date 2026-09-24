@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,13 +35,13 @@ from .selection import SetSelector
 def generate_predictions(
     model_path: Optional[Path] = None,
     policy_path: Optional[Path] = None,
-    output_path: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
     s1_path: Optional[Path] = None,
     s2_path: Optional[Path] = None,
     s3_path: Optional[Path] = None,
     batch_size: int = 50000,
     device: str = "auto",
-) -> Path:
+) -> Tuple[Path, Path]:
     """
     Generate predictions for test dataset and save official submission TSV.
     """
@@ -54,8 +54,10 @@ def generate_predictions(
             m_path = m_alt
 
     pol_path = Path(policy_path or (MODELS_DIR / "selection_policy.json"))
-    out_file = Path(output_path or (OUTPUT_DIR / "submission.tsv"))
-    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(output_dir or OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    matching_file = out_dir / "matching_results.tsv"
+    candidate_file = out_dir / "candidate_pairs.tsv"
 
     p_s1 = Path(s1_path or TEST_S1)
     p_s2 = Path(s2_path or TEST_S2)
@@ -65,7 +67,8 @@ def generate_predictions(
     print(f"Starting Entity Resolution Inference")
     print(f"Model: {m_path}")
     print(f"Test S1: {p_s1}")
-    print(f"Output:  {out_file}")
+    print(f"Matching Results Output:  {matching_file}")
+    print(f"Candidate Pairs Output:   {candidate_file}")
     print(f"============================================================")
 
     # 1. Load Model and Policy
@@ -102,17 +105,17 @@ def generate_predictions(
     cand_df = pd.DataFrame(list(cand_records.values()))
     print(f"  Candidate pool indexed. Total unique candidates: {len(cand_df):,}")
 
-    # 3. Stream through Test S1 in Batches & Write Predictions
+    # 3. Stream through Test S1 in Batches & Write Both Output TSVs
     print("\n[Step 3/4] Streaming Test S1 records and predicting matches...")
     fg = FeatureGenerator(config=DEFAULT_CONFIG)
 
-    # Open output submission file
     total_s1_processed = 0
     non_empty_predictions = 0
 
-    with open(out_file, "w", encoding="utf-8") as f_out:
-        # Write exact required header
-        f_out.write("source1_entity_id\tmatched_entity_ids\n")
+    with open(matching_file, "w", encoding="utf-8") as f_match, open(candidate_file, "w", encoding="utf-8") as f_cand:
+        # Write exact required headers
+        f_match.write("source1_entity_id\tmatched_entity_ids\n")
+        f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
 
         for s1_chunk in pd.read_csv(p_s1, sep="\t", chunksize=batch_size, dtype=str, keep_default_na=False):
             chunk_s1_ids = s1_chunk["entity_id"].tolist()
@@ -136,15 +139,22 @@ def generate_predictions(
             else:
                 chunk_preds = {sid: set() for sid in chunk_s1_ids}
 
-            # Write batch results
+            # Write batch results to both files
             for s1_id in chunk_s1_ids:
+                c_dict = cands_map.get(s1_id, {})
+                cands_list = list(c_dict.keys())
+                cand_str = ",".join(cands_list) if cands_list else ""
+                f_cand.write(f"{s1_id}\t{cand_str}\n")
+
                 matched_set = chunk_preds.get(s1_id, set())
-                if matched_set:
-                    matched_str = ",".join(sorted(matched_set))
+                # Enforce official validator constraint: matches must be subset of candidates
+                valid_matched = [m for m in sorted(matched_set) if m in c_dict]
+                if valid_matched:
+                    matched_str = ",".join(valid_matched)
                     non_empty_predictions += 1
                 else:
                     matched_str = ""
-                f_out.write(f"{s1_id}\t{matched_str}\n")
+                f_match.write(f"{s1_id}\t{matched_str}\n")
 
             total_s1_processed += len(chunk_s1_ids)
             print(f"  Processed {total_s1_processed:,} S1 entities... ({non_empty_predictions:,} matched)")
@@ -154,17 +164,18 @@ def generate_predictions(
     print(f"  Total S1 rows written: {total_s1_processed:,}")
     print(f"  Non-empty predictions: {non_empty_predictions:,} ({(non_empty_predictions/max(1, total_s1_processed))*100:.2f}%)")
     print(f"  Singletons (empty):    {total_s1_processed - non_empty_predictions:,} ({((total_s1_processed - non_empty_predictions)/max(1, total_s1_processed))*100:.2f}%)")
-    print(f"  Output saved to:       {out_file.resolve()}")
+    print(f"  Matching Results:      {matching_file.resolve()}")
+    print(f"  Candidate Pairs:       {candidate_file.resolve()}")
     print(f"Inference completed in {time.time() - t_start:.1f}s.")
 
-    return out_file
+    return matching_file, candidate_file
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate Official ER Predictions")
     parser.add_argument("--model-path", type=str, default=None, help="Path to trained model")
     parser.add_argument("--policy-path", type=str, default=None, help="Path to selection policy JSON")
-    parser.add_argument("--output-path", type=str, default=None, help="Output submission TSV path")
+    parser.add_argument("--output-dir", type=str, default=None, help="Directory to save matching_results.tsv and candidate_pairs.tsv")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="Inference device")
     parser.add_argument("--batch-size", type=int, default=50000, help="Batch size for S1 streaming")
     args = parser.parse_args()
@@ -172,7 +183,7 @@ if __name__ == "__main__":
     generate_predictions(
         model_path=Path(args.model_path) if args.model_path else None,
         policy_path=Path(args.policy_path) if args.policy_path else None,
-        output_path=Path(args.output_path) if args.output_path else None,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
         device=args.device,
         batch_size=args.batch_size,
     )

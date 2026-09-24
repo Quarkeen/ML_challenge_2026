@@ -35,12 +35,13 @@ class CandidateRetriever:
         self.top_k_tfidf = self.config.get("top_k_tfidf", 25)
         self.max_token_df = self.config.get("max_token_df_filter", 300)
         
-        # Per-country indexes: country -> {index_name -> dict}
         self.indexes: Dict[str, Dict[str, Any]] = defaultdict(dict)
-        self.candidate_metadata: Dict[str, Dict[str, Any]] = {}
-        self.tfidf_vectorizers: Dict[str, TfidfVectorizer] = {}
-        self.tfidf_matrices: Dict[str, csr_matrix] = {}
-        self.candidate_id_lookup: Dict[str, List[str]] = {}
+        # Accumulators across streaming chunks
+        self._exact_name_acc = defaultdict(lambda: defaultdict(list))
+        self._comp_name_acc = defaultdict(lambda: defaultdict(list))
+        self._token_acc = defaultdict(lambda: defaultdict(list))
+        self._addr_acc = defaultdict(lambda: defaultdict(list))
+        self.indexes_finalized = False
 
     @staticmethod
     def _extract_addr_signature_tokens(addr: str) -> List[str]:
@@ -55,80 +56,80 @@ class CandidateRetriever:
         }
         return [w for w in words if w not in common]
 
+    def index_chunk(self, df: pd.DataFrame) -> None:
+        """
+        Index a single DataFrame chunk into the accumulators.
+        Safe to call repeatedly across streaming file chunks.
+        """
+        if df is None or len(df) == 0:
+            return
+
+        self.indexes_finalized = False
+        ids = df["entity_id"].values
+        names = df["business_name"].fillna("").astype(str).values
+        addrs = df["business_address"].fillna("").astype(str).values
+        countries = df["country"].fillna("").astype(str).values if "country" in df.columns else [""] * len(df)
+
+        for cid, n, a, c in zip(ids, names, addrs, countries):
+            c_clean = str(c).strip()
+            p_n = punct_normalize(n)
+            c_n = compressed_name(n)
+
+            # 1. Exact punct-normalized name
+            if p_n:
+                self._exact_name_acc[c_clean][p_n].append(cid)
+
+            # 2. Compressed/domain name
+            if len(c_n) >= 5:
+                self._comp_name_acc[c_clean][c_n].append(cid)
+
+            # 3. Distinctive name tokens
+            words = set(p_n.split()) - {"inc", "llc", "ltd", "pvt", "private", "limited", "co", "corp", "the", "and"}
+            for w in words:
+                if len(w) >= 3:
+                    self._token_acc[c_clean][w].append(cid)
+
+            # 4. Address tokens
+            for aw in self._extract_addr_signature_tokens(a):
+                self._addr_acc[c_clean][aw].append(cid)
+
+    def finalize_indexes(self) -> "CandidateRetriever":
+        """
+        Finalize and prune inverted indexes after all chunks are ingested.
+        """
+        if self.indexes_finalized:
+            return self
+
+        for c in self._exact_name_acc:
+            self.indexes[c]["exact_name"] = dict(self._exact_name_acc[c])
+            self.indexes[c]["comp_name"] = dict(self._comp_name_acc[c])
+            self.indexes[c]["tokens"] = {
+                k: v for k, v in self._token_acc[c].items() if len(v) <= self.max_token_df
+            }
+            self.indexes[c]["addr"] = {
+                k: v for k, v in self._addr_acc[c].items() if 2 <= len(v) <= 150
+            }
+
+        self.indexes_finalized = True
+        return self
+
     def build_indexes(self, s2_records: Any, s3_records: Any) -> "CandidateRetriever":
         """
         Build inverted indexes across S2 and S3 candidate records.
-        Accepts DataFrames or iterables of records/chunks.
+        Accepts DataFrames or lists of chunks.
         """
-        exact_name_idx = defaultdict(lambda: defaultdict(list))
-        comp_name_idx = defaultdict(lambda: defaultdict(list))
-        token_idx = defaultdict(lambda: defaultdict(list))
-        addr_idx = defaultdict(lambda: defaultdict(list))
-        country_cands = defaultdict(list)
-
-        def index_batch(df):
-            if df is None or len(df) == 0:
+        def process(records):
+            if records is None:
                 return
-            ids = df["entity_id"].values
-            names = df["business_name"].fillna("").astype(str).values
-            addrs = df["business_address"].fillna("").astype(str).values
-            countries = df["country"].fillna("").astype(str).values if "country" in df.columns else [""] * len(df)
+            if isinstance(records, list):
+                for chunk in records:
+                    self.index_chunk(chunk)
+            elif isinstance(records, pd.DataFrame):
+                self.index_chunk(records)
 
-            for cid, n, a, c in zip(ids, names, addrs, countries):
-                c_clean = str(c).strip()
-                p_n = punct_normalize(n)
-                c_n = compressed_name(n)
-                
-                country_cands[c_clean].append((cid, p_n, a))
-                self.candidate_metadata[cid] = {
-                    "business_name": n,
-                    "business_address": a,
-                    "country": c_clean,
-                }
-
-                # 1. Exact punct-normalized name
-                if p_n:
-                    exact_name_idx[c_clean][p_n].append(cid)
-
-                # 2. Compressed/domain name
-                if len(c_n) >= 5:
-                    comp_name_idx[c_clean][c_n].append(cid)
-
-                # 3. Distinctive name tokens
-                words = set(p_n.split()) - {"inc", "llc", "ltd", "pvt", "private", "limited", "co", "corp", "the", "and"}
-                for w in words:
-                    if len(w) >= 3:
-                        token_idx[c_clean][w].append(cid)
-
-                # 4. Address tokens
-                for aw in self._extract_addr_signature_tokens(a):
-                    addr_idx[c_clean][aw].append(cid)
-
-        # Ingest S2 and S3
-        if isinstance(s2_records, list):
-            for chunk in s2_records:
-                index_batch(chunk)
-        else:
-            index_batch(s2_records)
-
-        if isinstance(s3_records, list):
-            for chunk in s3_records:
-                index_batch(chunk)
-        else:
-            index_batch(s3_records)
-
-        # Prune high-frequency tokens to keep retrieval fast and avoid noisy explosions
-        for c in exact_name_idx:
-            self.indexes[c]["exact_name"] = dict(exact_name_idx[c])
-            self.indexes[c]["comp_name"] = dict(comp_name_idx[c])
-            self.indexes[c]["tokens"] = {
-                k: v for k, v in token_idx[c].items() if len(v) <= self.max_token_df
-            }
-            self.indexes[c]["addr"] = {
-                k: v for k, v in addr_idx[c].items() if 2 <= len(v) <= 150
-            }
-
-        return self
+        process(s2_records)
+        process(s3_records)
+        return self.finalize_indexes()
 
     def fit(self, s2_df: pd.DataFrame, s3_df: pd.DataFrame) -> "CandidateRetriever":
         """Standard scikit-learn style alias for build_indexes."""

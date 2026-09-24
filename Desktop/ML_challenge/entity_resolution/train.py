@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Set, List, Tuple, Any
+from typing import Dict, Set, List, Tuple, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -85,18 +85,15 @@ def run_training_pipeline(
     print(f"  Train S1 entities: {len(train_s1_df):,}")
     print(f"  Val S1 entities:   {len(val_s1_df):,}")
 
-    # 3. Build Candidate Retriever Indexes from S2 and S3
+    # 3. Build Candidate Retriever Indexes from S2 and S3 (streaming accumulators)
     print("\n[Step 3/7] Building Candidate Retriever Indexes from S2 and S3...")
     retriever = CandidateRetriever(config=config)
     
-    # Ingest S2/S3 candidate pools via memory-efficient chunks
-    cand_records = {}
     for p, name in [(TRAIN_S2, "Source 2"), (TRAIN_S3, "Source 3")]:
         print(f"  Scanning and indexing {name}...")
         for chunk in pd.read_csv(p, sep="\t", chunksize=config["chunk_size"], dtype=str, keep_default_na=False):
-            retriever.build_indexes(chunk, None)
-            for _, row in chunk.iterrows():
-                cand_records[row["entity_id"]] = row.to_dict()
+            retriever.index_chunk(chunk)
+    retriever.finalize_indexes()
 
     # 4. Candidate Retrieval for Train and Validation sets
     print("\n[Step 4/7] Retrieving candidate matches...")
@@ -106,17 +103,33 @@ def run_training_pipeline(
     print(f"  Val Blocking Ceiling F_0.5: {blocking_metrics['blocking_ceiling_f05']:.4f}")
     print(f"  Avg candidates/entity: {blocking_metrics['avg_candidates_per_entity']:.1f}")
 
-    train_candidates = retriever.retrieve_candidates(train_s1_df, max_candidates=config["max_candidates_per_entity"])
+    # For training entities, cap to top 6 candidates to provide clean hard negatives without memory explosion
+    train_candidates = retriever.retrieve_candidates(train_s1_df, max_candidates=6)
 
-    # 5. Form Training Pairs (Positives + Hard Negatives from blocking)
-    print("\n[Step 5/7] Generating Pairwise Features...")
+    # 5. Fetch Record Metadata for Retrieved Candidates On Demand (Memory Safe)
+    needed_cand_ids = set()
+    for sid, cands in val_candidates.items():
+        needed_cand_ids.update(cands.keys())
+        needed_cand_ids.update(val_gt_map.get(sid, set()))
+    for sid, cands in train_candidates.items():
+        needed_cand_ids.update(cands.keys())
+        needed_cand_ids.update(gt_map.get(sid, set()))
+
+    print(f"\n[Step 5/7] Fetching metadata for {len(needed_cand_ids):,} retrieved candidates & generating features...")
+    cand_records = {}
+    for p in [TRAIN_S2, TRAIN_S3]:
+        for chunk in pd.read_csv(p, sep="\t", chunksize=config["chunk_size"], dtype=str, keep_default_na=False):
+            matches = chunk[chunk["entity_id"].isin(needed_cand_ids)]
+            for _, row in matches.iterrows():
+                cand_records[row["entity_id"]] = row.to_dict()
+
+    cand_df = pd.DataFrame(list(cand_records.values()))
     fg = FeatureGenerator(config=config)
 
     def build_pairs_and_labels(s1_df, cand_map, is_train=True):
         pairs = []
         labels = []
         retrieval_meta = {}
-        s1_lookup = s1_df.set_index("entity_id").to_dict(orient="index")
 
         for s1_id, cands in cand_map.items():
             true_matches = gt_map.get(s1_id, set())
@@ -138,9 +151,7 @@ def run_training_pipeline(
                 labels.append(is_pos)
                 retrieval_meta[(s1_id, cid)] = info
 
-        # Compute features
         print(f"  Computing features for {len(pairs):,} pairs...")
-        cand_df = pd.DataFrame(list(cand_records.values()))
         feats_df = fg.compute_batch_features(s1_df, cand_df, pairs, retrieval_info=retrieval_meta)
         feats_df["target"] = labels
         return feats_df
