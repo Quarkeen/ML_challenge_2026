@@ -149,6 +149,7 @@ class PairwiseRanker:
 
         if self.model_type == "xgboost":
             import xgboost as xgb
+            self.model.set_param({"device": self.device})
             dmat = xgb.DMatrix(X_mat, feature_names=self.feature_names)
             return self.model.predict(dmat)
         elif self.model_type == "lightgbm":

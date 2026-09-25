@@ -27,6 +27,15 @@ class FeatureGenerator:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
+        self._candidate_index: Optional[pd.DataFrame] = None
+        self._candidate_source_id: Optional[int] = None
+
+    def prepare_candidate_index(self, cand_df: pd.DataFrame) -> None:
+        """Build the candidate index once for repeated batch scoring."""
+        if self._candidate_source_id == id(cand_df):
+            return
+        self._candidate_index = cand_df.set_index("entity_id", drop=False)
+        self._candidate_source_id = id(cand_df)
 
     @staticmethod
     def _char_ngrams(s: str, n: int = 3) -> set:
@@ -173,9 +182,14 @@ class FeatureGenerator:
         if not pairs:
             return pd.DataFrame()
 
-        # Build fast row lookups
+        # Build the stable candidate index once and materialize only rows used
+        # by this batch.
         s1_dict = s1_df.set_index("entity_id").to_dict(orient="index") if "entity_id" in s1_df.columns else {}
-        cand_dict = cand_df.set_index("entity_id").to_dict(orient="index") if "entity_id" in cand_df.columns else {}
+        self.prepare_candidate_index(cand_df)
+        candidate_ids = list(dict.fromkeys(cand_id for _, cand_id in pairs))
+        candidate_rows = self._candidate_index.reindex(candidate_ids)
+        candidate_rows = candidate_rows[candidate_rows.index.notna()]
+        cand_dict = candidate_rows.to_dict(orient="index")
 
         rows = []
         for s1_id, cand_id in pairs:

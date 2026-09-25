@@ -40,6 +40,7 @@ def generate_predictions(
     s2_path: Optional[Path] = None,
     s3_path: Optional[Path] = None,
     batch_size: int = 50000,
+    max_candidates: Optional[int] = None,
     device: str = "auto",
 ) -> Tuple[Path, Path]:
     """
@@ -111,6 +112,7 @@ def generate_predictions(
 
     total_s1_processed = 0
     non_empty_predictions = 0
+    candidate_limit = max_candidates or DEFAULT_CONFIG["max_candidates_per_entity"]
 
     with open(matching_file, "w", encoding="utf-8") as f_match, open(candidate_file, "w", encoding="utf-8") as f_cand:
         # Write exact required headers
@@ -118,10 +120,13 @@ def generate_predictions(
         f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
 
         for s1_chunk in pd.read_csv(p_s1, sep="\t", chunksize=batch_size, dtype=str, keep_default_na=False):
+            batch_start = time.perf_counter()
             chunk_s1_ids = s1_chunk["entity_id"].tolist()
             
             # Retrieve candidates for chunk
-            cands_map = retriever.retrieve_candidates(s1_chunk, max_candidates=DEFAULT_CONFIG["max_candidates_per_entity"])
+            retrieve_start = time.perf_counter()
+            cands_map = retriever.retrieve_candidates(s1_chunk, max_candidates=candidate_limit)
+            retrieve_seconds = time.perf_counter() - retrieve_start
 
             # Flatten pairs for scoring
             pairs = []
@@ -132,11 +137,16 @@ def generate_predictions(
                     retrieval_meta[(s1_id, cid)] = info
 
             if pairs:
+                feature_start = time.perf_counter()
                 feats_df = fg.compute_batch_features(s1_chunk, cand_df, pairs, retrieval_info=retrieval_meta)
+                feature_seconds = time.perf_counter() - feature_start
+                predict_start = time.perf_counter()
                 scores = ranker.predict_proba(feats_df)
+                predict_seconds = time.perf_counter() - predict_start
                 feats_df["score"] = scores
                 chunk_preds = selector.predict_sets(feats_df, all_s1_ids=chunk_s1_ids)
             else:
+                feature_seconds = predict_seconds = 0.0
                 chunk_preds = {sid: set() for sid in chunk_s1_ids}
 
             # Write batch results to both files
@@ -157,7 +167,14 @@ def generate_predictions(
                 f_match.write(f"{s1_id}\t{matched_str}\n")
 
             total_s1_processed += len(chunk_s1_ids)
-            print(f"  Processed {total_s1_processed:,} S1 entities... ({non_empty_predictions:,} matched)")
+            batch_seconds = time.perf_counter() - batch_start
+            print(
+                f"  Processed {total_s1_processed:,} S1 entities... "
+                f"({non_empty_predictions:,} matched) | "
+                f"pairs={len(pairs):,}, retrieve={retrieve_seconds:.1f}s, "
+                f"features={feature_seconds:.1f}s, model={predict_seconds:.1f}s, "
+                f"total={batch_seconds:.1f}s"
+            )
 
     # 4. Summary & Verification
     print("\n[Step 4/4] Validating submission integrity...")
@@ -178,6 +195,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default=None, help="Directory to save matching_results.tsv and candidate_pairs.tsv")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="Inference device")
     parser.add_argument("--batch-size", type=int, default=50000, help="Batch size for S1 streaming")
+    parser.add_argument("--max-candidates", type=int, default=None, help="Maximum candidates per S1 entity (default: config value)")
     args = parser.parse_args()
 
     generate_predictions(
@@ -186,4 +204,5 @@ if __name__ == "__main__":
         output_dir=Path(args.output_dir) if args.output_dir else None,
         device=args.device,
         batch_size=args.batch_size,
+        max_candidates=args.max_candidates,
     )
