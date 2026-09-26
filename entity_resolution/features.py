@@ -5,7 +5,7 @@ using RapidFuzz and local deterministic token statistics without external lookup
 """
 
 import re
-from typing import Dict, Any, List, Tuple, Optional, Union
+from typing import Dict, Any, List, Tuple, Optional, Union, NamedTuple
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
@@ -16,7 +16,62 @@ from .normalize import (
     strip_legal_suffix,
     parse_address_fields,
     alphanum_only,
+    prepared_name_signatures,
+    stripped_from_punct,
 )
+
+
+_NAME_STOPWORDS = {"inc", "llc", "ltd", "pvt", "private", "limited", "co", "corp", "the", "and"}
+PREPARED_FEATURE_NAMES = (
+    "name_exact_punct", "name_exact_compressed", "name_exact_stripped", "legal_suffix_match",
+    "name_fuzz_ratio", "name_fuzz_partial", "name_token_sort", "name_token_set",
+    "name_stripped_ratio", "name_ngram_jaccard", "name_shared_token_count",
+    "name_token_jaccard", "name_len_diff", "name_len_ratio", "s1_addr_missing",
+    "cand_addr_missing", "both_addr_present", "hn_exact_match", "hn_contradiction",
+    "postal_exact_match", "postal_prefix_match", "postal_contradiction",
+    "addr_fuzz_ratio", "addr_token_sort", "addr_token_set", "is_source2",
+    "is_source3", "country_match", "retrieval_score", "retrieved_by_exact",
+    "retrieved_by_comp", "retrieved_by_token", "retrieved_by_addr",
+)
+
+
+class PreparedRecord(NamedTuple):
+    name: str
+    sorted_name: str
+    compressed: str
+    stripped: str
+    suffix: str
+    ngrams: set
+    tokens: set
+    address: str
+    sorted_address: str
+    address_missing: bool
+    house_number: str
+    postal_code: str
+    country: str
+
+
+def prepare_record(name: str, address: str, country: str) -> PreparedRecord:
+    """Cacheable per-record work; uses exactly the same normalizers as pair features."""
+    normalized_name, compressed = prepared_name_signatures(name)
+    stripped, suffix = stripped_from_punct(normalized_name)
+    parsed = parse_address_fields(address, country)
+    normalized_address = parsed["normalized_address"]
+    return PreparedRecord(
+        normalized_name,
+        " ".join(sorted(normalized_name.split())),
+        compressed,
+        stripped,
+        suffix,
+        FeatureGenerator._char_ngrams(normalized_name, 3),
+        set(normalized_name.split()) - _NAME_STOPWORDS,
+        normalized_address,
+        " ".join(sorted(normalized_address.split())),
+        not bool(normalized_address) or normalized_address in ("nan", "none"),
+        parsed["house_number"],
+        parsed["postal_code"],
+        str(country).strip().upper(),
+    )
 
 
 class FeatureGenerator:
@@ -158,6 +213,73 @@ class FeatureGenerator:
             feats["retrieved_by_addr"] = 0.0
 
         return feats
+
+    @staticmethod
+    def compute_prepared_pair_features(
+        s1: PreparedRecord,
+        candidate: PreparedRecord,
+        candidate_id: str,
+        retrieval_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
+        """Compute the original feature set from reusable per-record values."""
+        return dict(zip(
+            PREPARED_FEATURE_NAMES,
+            FeatureGenerator.compute_prepared_pair_values(s1, candidate, candidate_id, retrieval_meta),
+        ))
+
+    @staticmethod
+    def compute_prepared_pair_values(
+        s1: PreparedRecord,
+        candidate: PreparedRecord,
+        candidate_id: str,
+        retrieval_meta: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[float, ...]:
+        """Return features in PREPARED_FEATURE_NAMES order without per-pair dictionaries."""
+        n1, n2 = s1.name, candidate.name
+        g1, g2 = s1.ngrams, candidate.ngrams
+        t1, t2 = s1.tokens, candidate.tokens
+        shared_t, total_t = t1 & t2, t1 | t2
+        union_g = g1 | g2
+        hn1, hn2 = s1.house_number, candidate.house_number
+        pc1, pc2 = s1.postal_code, candidate.postal_code
+        both_addr_present = not s1.address_missing and not candidate.address_missing
+        methods = str(retrieval_meta.get("retrieval_methods", "")) if retrieval_meta else ""
+
+        return (
+            float(n1 == n2 and bool(n1)),
+            float(s1.compressed == candidate.compressed and len(s1.compressed) >= 4),
+            float(s1.stripped == candidate.stripped and bool(s1.stripped)),
+            float(bool(s1.suffix) and s1.suffix == candidate.suffix),
+            fuzz.ratio(n1, n2) / 100.0,
+            fuzz.partial_ratio(n1, n2) / 100.0,
+            fuzz.ratio(s1.sorted_name, candidate.sorted_name) / 100.0,
+            fuzz.token_set_ratio(n1, n2) / 100.0,
+            fuzz.ratio(s1.stripped, candidate.stripped) / 100.0,
+            (len(g1 & g2) / len(union_g)) if union_g else 0.0,
+            float(len(shared_t)),
+            (len(shared_t) / len(total_t)) if total_t else 0.0,
+            float(abs(len(n1) - len(n2))),
+            min(len(n1), len(n2)) / max(1, max(len(n1), len(n2))),
+            float(s1.address_missing),
+            float(candidate.address_missing),
+            float(both_addr_present),
+            float(hn1 == hn2) if hn1 and hn2 else 0.0,
+            float(hn1 != hn2) if hn1 and hn2 else 0.0,
+            float(pc1 == pc2) if pc1 and pc2 else 0.0,
+            float(pc1[:3] == pc2[:3]) if pc1 and pc2 else 0.0,
+            float(pc1 != pc2) if pc1 and pc2 else 0.0,
+            fuzz.ratio(s1.address, candidate.address) / 100.0 if both_addr_present else 0.0,
+            fuzz.ratio(s1.sorted_address, candidate.sorted_address) / 100.0 if both_addr_present else 0.0,
+            fuzz.token_set_ratio(s1.address, candidate.address) / 100.0 if both_addr_present else 0.0,
+            float(candidate_id.startswith("S2-")),
+            float(candidate_id.startswith("S3-")),
+            float(s1.country == candidate.country),
+            float(retrieval_meta.get("retrieval_score", 0.0)) if retrieval_meta else 0.0,
+            float("exact_name" in methods),
+            float("comp_name" in methods),
+            float("token" in methods),
+            float("addr" in methods),
+        )
 
     def compute_batch_features(
         self,

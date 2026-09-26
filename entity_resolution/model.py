@@ -138,12 +138,19 @@ class PairwiseRanker:
 
         return self
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
         """Compute matching probability scores for candidate pairs."""
         if self.model is None:
             raise ValueError("Model has not been trained yet.")
 
-        X_mat = X[self.feature_names].astype(np.float32).fillna(0.0).values
+        if isinstance(X, np.ndarray):
+            if X.ndim != 2 or X.shape[1] != len(self.feature_names):
+                raise ValueError("Feature array must have one column per trained feature")
+            X_mat = np.ascontiguousarray(X, dtype=np.float32)
+            if np.isnan(X_mat).any():
+                X_mat = np.nan_to_num(X_mat, nan=0.0, posinf=np.inf, neginf=-np.inf)
+        else:
+            X_mat = X[self.feature_names].astype(np.float32).fillna(0.0).values
         if len(X_mat) == 0:
             return np.array([])
 

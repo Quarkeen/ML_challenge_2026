@@ -19,6 +19,7 @@ from .normalize import (
     strip_legal_suffix,
     extract_postal_code,
     alphanum_only,
+    prepared_name_signatures,
 )
 from .scorer import entity_f05, detailed_evaluation
 
@@ -56,7 +57,7 @@ class CandidateRetriever:
         }
         return [w for w in words if w not in common]
 
-    def index_chunk(self, df: pd.DataFrame) -> None:
+    def index_chunk(self, df: pd.DataFrame, assume_strings: bool = False) -> None:
         """
         Index a single DataFrame chunk into the accumulators.
         Safe to call repeatedly across streaming file chunks.
@@ -66,14 +67,15 @@ class CandidateRetriever:
 
         self.indexes_finalized = False
         ids = df["entity_id"].values
-        names = df["business_name"].fillna("").astype(str).values
-        addrs = df["business_address"].fillna("").astype(str).values
-        countries = df["country"].fillna("").astype(str).values if "country" in df.columns else [""] * len(df)
+        # Inference reads dtype=str with keep_default_na=False, so these are
+        # already strings. The default retains the general DataFrame behavior.
+        names = df["business_name"].values if assume_strings else df["business_name"].fillna("").astype(str).values
+        addrs = df["business_address"].values if assume_strings else df["business_address"].fillna("").astype(str).values
+        countries = (df["country"].values if assume_strings else df["country"].fillna("").astype(str).values) if "country" in df.columns else [""] * len(df)
 
         for cid, n, a, c in zip(ids, names, addrs, countries):
             c_clean = str(c).strip()
-            p_n = punct_normalize(n)
-            c_n = compressed_name(n)
+            p_n, c_n = prepared_name_signatures(n)
 
             # 1. Exact punct-normalized name
             if p_n:
@@ -93,7 +95,7 @@ class CandidateRetriever:
             for aw in self._extract_addr_signature_tokens(a):
                 self._addr_acc[c_clean][aw].append(cid)
 
-    def finalize_indexes(self) -> "CandidateRetriever":
+    def finalize_indexes(self, release_accumulators: bool = False) -> "CandidateRetriever":
         """
         Finalize and prune inverted indexes after all chunks are ingested.
         """
@@ -111,6 +113,13 @@ class CandidateRetriever:
             }
 
         self.indexes_finalized = True
+        if release_accumulators:
+            # Inference builds the complete pool once. The finalized maps own
+            # the retained posting lists, so the ingestion maps can be freed.
+            self._exact_name_acc.clear()
+            self._comp_name_acc.clear()
+            self._token_acc.clear()
+            self._addr_acc.clear()
         return self
 
     def build_indexes(self, s2_records: Any, s3_records: Any) -> "CandidateRetriever":
@@ -139,6 +148,7 @@ class CandidateRetriever:
         self,
         s1_df: pd.DataFrame,
         max_candidates: Optional[int] = None,
+        assume_strings: bool = False,
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """
         Retrieve candidate matching records for all S1 entities.
@@ -148,14 +158,13 @@ class CandidateRetriever:
         results = {}
 
         ids = s1_df["entity_id"].values
-        names = s1_df["business_name"].fillna("").astype(str).values
-        addrs = s1_df["business_address"].fillna("").astype(str).values
-        countries = s1_df["country"].fillna("").astype(str).values if "country" in s1_df.columns else [""] * len(s1_df)
+        names = s1_df["business_name"].values if assume_strings else s1_df["business_name"].fillna("").astype(str).values
+        addrs = s1_df["business_address"].values if assume_strings else s1_df["business_address"].fillna("").astype(str).values
+        countries = (s1_df["country"].values if assume_strings else s1_df["country"].fillna("").astype(str).values) if "country" in s1_df.columns else [""] * len(s1_df)
 
         for s1_id, name, addr, country in zip(ids, names, addrs, countries):
             c_clean = str(country).strip()
-            p_n = punct_normalize(name)
-            c_n = compressed_name(name)
+            p_n, c_n = prepared_name_signatures(name)
             words = set(p_n.split()) - {"inc", "llc", "ltd", "pvt", "private", "limited", "co", "corp", "the", "and"}
             a_tokens = self._extract_addr_signature_tokens(addr)
 

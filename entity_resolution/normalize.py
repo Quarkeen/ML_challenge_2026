@@ -116,6 +116,23 @@ def compressed_name(text: Any) -> str:
     return alphanum_only(stripped)
 
 
+def prepared_name_signatures(text: Any) -> Tuple[str, str]:
+    """Return the existing punct and compressed forms without changing either definition."""
+    normalized = punct_normalize(text)
+    return normalized, compressed_name(text)
+
+
+def stripped_from_punct(normalized: str) -> Tuple[str, str]:
+    """Apply strip_legal_suffix's existing regex to an already normalized name."""
+    if not normalized:
+        return "", ""
+    match = LEGAL_PATTERN.search(normalized)
+    suffix = match.group(0).strip() if match else ""
+    stripped = LEGAL_PATTERN.sub(" ", normalized)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    return (stripped if stripped else normalized, suffix)
+
+
 def parse_address_fields(address_text: Any, country: str = "") -> Dict[str, Any]:
     """
     Conservatively parse address into structured components without external geocoding:
