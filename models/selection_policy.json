@@ -1,0 +1,31 @@
+{
+  "thresholds": {
+    "match_threshold": 0.6,
+    "empty_threshold": 0.25,
+    "relative_gap": 0.2,
+    "max_matches": 10
+  },
+  "validation_metrics": {
+    "macro_f05": 0.7623383313132085,
+    "total_entities": 10000,
+    "true_singletons_count": 547,
+    "true_singletons_pct": 5.47,
+    "empty_list_accuracy": 0.8738574040219378,
+    "false_nonempty_rate": 0.12614259597806216,
+    "f05_1_match": 0.5962776958252072,
+    "f05_2plus_matches": 0.7656692142373103,
+    "f05_s2_only": 0.7173058657348206,
+    "f05_s3_only": 0.6479958595179285,
+    "f05_mixed": 0.7693141609455202,
+    "f05_country_India": 0.7327447434130666,
+    "f05_country_US": 0.7821250002129364
+  },
+  "blocking_metrics": {
+    "blocking_recall": 0.6598727956056664,
+    "blocking_ceiling_f05": 0.8112845906519159,
+    "retrieved_true_matches": 22825,
+    "total_true_matches": 34590,
+    "avg_candidates_per_entity": 37.32
+  },
+  "elapsed_seconds": 625.6345973014832
+}
