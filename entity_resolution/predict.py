@@ -73,6 +73,28 @@ def _feature_group(job):
     return matrix
 
 
+def _feature_jobs(items, cand_records, num_workers: int, pair_count: int):
+    """Keep worker jobs bounded and balanced by feature pairs, in S1 order."""
+    target_pairs = max(1, (pair_count + num_workers * 4 - 1) // (num_workers * 4))
+    group_items = []
+    group_pairs = 0
+    for item in items:
+        group_items.append(item)
+        group_pairs += len(item[2])
+        if group_pairs >= target_pairs:
+            yield group_items, {
+                cid: cand_records[cid]
+                for _, _, candidates in group_items for cid in candidates
+            }
+            group_items = []
+            group_pairs = 0
+    if group_items:
+        yield group_items, {
+            cid: cand_records[cid]
+            for _, _, candidates in group_items for cid in candidates
+        }
+
+
 def generate_predictions(
     model_path: Optional[Path] = None,
     policy_path: Optional[Path] = None,
@@ -216,6 +238,9 @@ def generate_predictions(
             initializer=_init_feature_worker,
             initargs=(candidate_cache_size // num_workers, feature_positions),
         )
+        print(f"  Feature generation: {num_workers} spawned CPU workers")
+    else:
+        print("  Feature generation: 1 CPU worker (use --num-workers N to parallelize)")
 
     # 3. Stream through Test S1 in Batches & Write Both Output TSVs
     print("\n[Step 3/4] Streaming Test S1 records and predicting matches...")
@@ -308,15 +333,9 @@ def generate_predictions(
             elif pair_count:
                 items = [(sid, s1_rows.get(sid, ("", "", "")), candidates)
                          for sid, candidates in cands_map.items()]
-                group_size = max(1, (len(items) + num_workers * 2 - 1) // (num_workers * 2))
-                def groups():
-                    for start in range(0, len(items), group_size):
-                        group_items = items[start:start + group_size]
-                        group_records = {cid: cand_records[cid]
-                                         for _, _, candidates in group_items for cid in candidates}
-                        yield group_items, group_records
                 feature_index = 0
-                for block in active_pool.imap(_feature_group, groups(), chunksize=1):
+                jobs = _feature_jobs(items, cand_records, num_workers, pair_count)
+                for block in active_pool.imap(_feature_group, jobs, chunksize=1):
                     next_index = feature_index + len(block)
                     feature_matrix[feature_index:next_index] = block
                     feature_index = next_index

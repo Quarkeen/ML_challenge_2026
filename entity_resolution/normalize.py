@@ -33,6 +33,10 @@ DOMAIN_PATTERN = re.compile(
 
 def raw_name(text: Any) -> str:
     """Return raw string value, preserving original formatting."""
+    # Inference reads TSV fields as strings. Avoid a pandas scalar missing-value
+    # check for every name and address while preserving the generic path.
+    if isinstance(text, str):
+        return text.strip()
     if text is None or pd.isna(text):
         return ""
     return str(text).strip()
@@ -43,6 +47,8 @@ def unicode_normalize(text: Any) -> str:
     raw = raw_name(text)
     if not raw:
         return ""
+    if raw.isascii():
+        return raw
     nfkd = unicodedata.normalize("NFKD", raw)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 

@@ -18,10 +18,16 @@ from .normalize import (
     alphanum_only,
     prepared_name_signatures,
     stripped_from_punct,
+    raw_name,
 )
 
 
 _NAME_STOPWORDS = {"inc", "llc", "ltd", "pvt", "private", "limited", "co", "corp", "the", "and"}
+_HOUSE_NUMBER_PATTERN = re.compile(r"\b(\d{1,6}[a-zA-Z]?)\b")
+_POSTAL_US_PATTERN = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
+_POSTAL_IN_PATTERN = re.compile(r"\b([1-8]\d{5})\b")
+_POSTAL_FR_PATTERN = re.compile(r"\b(\d{5})\b")
+_POSTAL_OTHER_PATTERN = re.compile(r"\b(\d{5,6})\b")
 PREPARED_FEATURE_NAMES = (
     "name_exact_punct", "name_exact_compressed", "name_exact_stripped", "legal_suffix_match",
     "name_fuzz_ratio", "name_fuzz_partial", "name_token_sort", "name_token_set",
@@ -51,12 +57,35 @@ class PreparedRecord(NamedTuple):
     country: str
 
 
+def _prepared_address_parts(address: str, country: str) -> Tuple[str, str, str]:
+    """Return the three parse_address_fields values used by inference."""
+    raw = raw_name(address)
+    if not raw:
+        return "", "", ""
+    normalized = punct_normalize(raw)
+    house_match = _HOUSE_NUMBER_PATTERN.search(normalized)
+    country_upper = str(country).strip().upper()
+    if country_upper in ("US", "USA"):
+        postal_pattern = _POSTAL_US_PATTERN
+    elif country_upper in ("INDIA", "IN"):
+        postal_pattern = _POSTAL_IN_PATTERN
+    elif country_upper in ("FRANCE", "FR"):
+        postal_pattern = _POSTAL_FR_PATTERN
+    else:
+        postal_pattern = _POSTAL_OTHER_PATTERN
+    postal_match = postal_pattern.search(raw)
+    return (
+        normalized,
+        house_match.group(1) if house_match else "",
+        postal_match.group(1) if postal_match else "",
+    )
+
+
 def prepare_record(name: str, address: str, country: str) -> PreparedRecord:
     """Cacheable per-record work; uses exactly the same normalizers as pair features."""
     normalized_name, compressed = prepared_name_signatures(name)
     stripped, suffix = stripped_from_punct(normalized_name)
-    parsed = parse_address_fields(address, country)
-    normalized_address = parsed["normalized_address"]
+    normalized_address, house_number, postal_code = _prepared_address_parts(address, country)
     return PreparedRecord(
         normalized_name,
         " ".join(sorted(normalized_name.split())),
@@ -68,8 +97,8 @@ def prepare_record(name: str, address: str, country: str) -> PreparedRecord:
         normalized_address,
         " ".join(sorted(normalized_address.split())),
         not bool(normalized_address) or normalized_address in ("nan", "none"),
-        parsed["house_number"],
-        parsed["postal_code"],
+        house_number,
+        postal_code,
         str(country).strip().upper(),
     )
 
@@ -238,8 +267,10 @@ class FeatureGenerator:
         n1, n2 = s1.name, candidate.name
         g1, g2 = s1.ngrams, candidate.ngrams
         t1, t2 = s1.tokens, candidate.tokens
-        shared_t, total_t = t1 & t2, t1 | t2
-        union_g = g1 | g2
+        shared_t_count = len(t1 & t2)
+        total_t_count = len(t1) + len(t2) - shared_t_count
+        shared_g_count = len(g1 & g2)
+        union_g_count = len(g1) + len(g2) - shared_g_count
         hn1, hn2 = s1.house_number, candidate.house_number
         pc1, pc2 = s1.postal_code, candidate.postal_code
         both_addr_present = not s1.address_missing and not candidate.address_missing
@@ -255,9 +286,9 @@ class FeatureGenerator:
             fuzz.ratio(s1.sorted_name, candidate.sorted_name) / 100.0,
             fuzz.token_set_ratio(n1, n2) / 100.0,
             fuzz.ratio(s1.stripped, candidate.stripped) / 100.0,
-            (len(g1 & g2) / len(union_g)) if union_g else 0.0,
-            float(len(shared_t)),
-            (len(shared_t) / len(total_t)) if total_t else 0.0,
+            (shared_g_count / union_g_count) if union_g_count else 0.0,
+            float(shared_t_count),
+            (shared_t_count / total_t_count) if total_t_count else 0.0,
             float(abs(len(n1) - len(n2))),
             min(len(n1), len(n2)) / max(1, max(len(n1), len(n2))),
             float(s1.address_missing),

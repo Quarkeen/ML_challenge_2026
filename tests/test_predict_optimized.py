@@ -4,10 +4,13 @@ import numpy as np
 import pandas as pd
 
 from entity_resolution.blocking import CandidateRetriever
-from entity_resolution.features import FeatureGenerator, PREPARED_FEATURE_NAMES, prepare_record
+from entity_resolution.features import (
+    FeatureGenerator, PREPARED_FEATURE_NAMES, _prepared_address_parts, prepare_record,
+)
 from entity_resolution.normalize import (
     compressed_name, prepared_name_signatures, punct_normalize,
-    strip_legal_suffix, stripped_from_punct,
+    parse_address_fields, raw_name, strip_legal_suffix, stripped_from_punct,
+    unicode_normalize,
 )
 from entity_resolution.selection import SetSelector
 
@@ -49,6 +52,35 @@ def test_reused_name_normalization_matches_reference():
         assert normalized == punct_normalize(name)
         assert compressed == compressed_name(name)
         assert stripped_from_punct(normalized) == strip_legal_suffix(name)
+
+
+def test_prepared_address_parts_match_reference_parser():
+    cases = (
+        ("", "US"), ("none", ""), ("500 Market St, Denver, CO 80202", "US"),
+        ("Apt 12, 500 Market St, Denver 80202-1234", "USA"),
+        ("Plot 24, Hyderabad 500081", "India"),
+        ("10 Rue de Rivoli, 75001 Paris", "FR"),
+        ("  10 Rue de Rivoli 75001  ", "France"),
+        ("Building 12, 123456", ""),
+    )
+    for address, country in cases:
+        reference = parse_address_fields(address, country)
+        assert _prepared_address_parts(address, country) == (
+            reference["normalized_address"], reference["house_number"], reference["postal_code"],
+        )
+
+
+def test_ascii_normalization_fast_path_preserves_values():
+    import unicodedata
+
+    for value in ("", "  Atlas & Co.  ", "500 Market St\t", "Cafe", "Café", "Müller"):
+        stripped = value.strip()
+        expected = "".join(
+            char for char in unicodedata.normalize("NFKD", stripped)
+            if not unicodedata.combining(char)
+        )
+        assert raw_name(value) == stripped
+        assert unicode_normalize(value) == expected
 
 
 def test_feature_worker_block_matches_reference():
@@ -99,6 +131,24 @@ def test_spawned_worker_receives_only_group_records():
         blocks = pool.map(prediction._feature_group, [job, job])
     assert len(blocks) == 2
     np.testing.assert_array_equal(blocks[0], blocks[1])
+
+
+def test_parallel_jobs_preserve_order_and_transfer_only_needed_candidates():
+    import entity_resolution.predict as prediction
+
+    records = {f"S2-{i}": (f"Name {i}", "", "US") for i in range(10)}
+    meta = {"retrieval_score": 3.5, "retrieval_methods": "token"}
+    items = [
+        ("S1-1", ("Name 1", "", "US"), {"S2-1": meta}),
+        ("S1-2", ("Name 2", "", "US"), {f"S2-{i}": meta for i in range(2, 7)}),
+        ("S1-3", ("Name 3", "", "US"), {}),
+        ("S1-4", ("Name 4", "", "US"), {"S2-7": meta}),
+    ]
+    jobs = list(prediction._feature_jobs(items, records, num_workers=2, pair_count=7))
+    assert [item[0] for group, _ in jobs for item in group] == [item[0] for item in items]
+    for group, needed in jobs:
+        assert set(needed) == {cid for _, _, candidates in group for cid in candidates}
+    assert all(len(needed) < len(records) for _, needed in jobs)
 
 
 def test_string_input_fast_path_preserves_candidates():
